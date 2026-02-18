@@ -1,0 +1,95 @@
+{
+  "meta": {
+    "name": "demo",
+    "league": "nba",
+    "stat_type": "points"
+  },
+  "engine": {
+    "n_sims": 20000,
+    "method": "normal",
+    "seed": 42,
+    "repair_covariance": true,
+    "covariance_stress_scale": 1.0
+  },
+  "players": {
+    "profiles": [
+      {
+        "player_id": "A",
+        "usage_rate": 0.3,
+        "assist_rate": 0.22,
+        "rebound_rate": 0.1,
+        "position": "G",
+        "minutes_avg": 34.0
+      },
+      {
+        "player_id": "B",
+        "usage_rate": 0.26,
+        "assist_rate": 0.18,
+        "rebound_rate": 0.12,
+        "position": "G",
+        "minutes_avg": 32.0
+      },
+      {
+        "player_id": "C",
+        "usage_rate": 0.22,
+        "assist_rate": 0.12,
+        "rebound_rate": 0.18,
+        "position": "F",
+        "minutes_avg": 30.0
+      },
+      {
+        "player_id": "D",
+        "usage_rate": 0.18,
+        "assist_rate": 0.08,
+        "rebound_rate": 0.22,
+        "position": "C",
+        "minutes_avg": 28.0
+      }
+    ],
+    "distributions": [
+      {
+        "player_id": "A",
+        "mean": 22.0,
+        "std": 5.0
+      },
+      {
+        "player_id": "B",
+        "mean": 18.0,
+        "std": 4.5
+      },
+      {
+        "player_id": "C",
+        "mean": 15.0,
+        "std": 4.0
+      },
+      {
+        "player_id": "D",
+        "mean": 12.0,
+        "std": 3.5
+      }
+    ]
+  },
+  "scenarios": [
+    {
+      "name": "baseline",
+      "minutes_multiplier": {},
+      "remove_players": [],
+      "redistribute_usage": false,
+      "covariance_stress_scale": null
+    },
+    {
+      "name": "corr_stress_1_5x",
+      "minutes_multiplier": {},
+      "remove_players": [],
+      "redistribute_usage": false,
+      "covariance_stress_scale": 1.5
+    },
+    {
+      "name": "star_A_out",
+      "usage_shift": {
+        "out_player": "A"
+      }
+    }
+  ],
+  "legs": null
+}

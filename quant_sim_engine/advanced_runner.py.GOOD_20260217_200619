@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import time
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+
+from quant_sim_engine.sim.covariance_engine import PlayerCovarianceProfile, create_covariance_matrix
+from quant_sim_engine.sim.joint_sampler import PlayerDistribution, sample_correlated_players
+
+# Optional imports (only used if present in your codebase)
+try:
+    from quant_sim_engine.sim.joint_sampler import compute_parlay_ev  # expects your internal schema
+except Exception:
+    compute_parlay_ev = None
+
+try:
+    from quant_sim_engine.sim.usage_redistribution import redistribute_missing_usage, UsageProfile, PlayerRole
+except Exception:
+    redistribute_missing_usage = None
+    UsageProfile = None
+    PlayerRole = None
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def now_ts() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+def read_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def write_csv_matrix(path: Path, labels: List[str], mat: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([""] + labels)
+        for i, row in enumerate(mat):
+            w.writerow([labels[i]] + [float(x) for x in row])
+
+def write_csv_samples(path: Path, player_ids: List[str], samples: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["sim_index"] + player_ids)
+        for i in range(samples.shape[0]):
+            w.writerow([i] + [float(x) for x in samples[i, :]])
+
+def is_symmetric(a: np.ndarray, tol: float = 1e-10) -> bool:
+    return np.allclose(a, a.T, atol=tol, rtol=0)
+
+def min_eig(a: np.ndarray) -> float:
+    return float(np.min(np.linalg.eigvalsh(a)))
+
+def symmetrize(a: np.ndarray) -> np.ndarray:
+    return 0.5 * (a + a.T)
+
+def repair_psd(a: np.ndarray, base_jitter: float = 1e-8, max_tries: int = 10) -> Tuple[np.ndarray, float, float]:
+    """
+    Adds diagonal jitter until PSD-ish.
+    Returns (repaired, jitter_used, min_eig_after).
+    """
+    a = symmetrize(a)
+    used = 0.0
+    for k in range(max_tries):
+        m = min_eig(a)
+        if m >= -1e-12:
+            return a, used, m
+        used = base_jitter * (10 ** k)
+        a = a + np.eye(a.shape[0]) * used
+    return a, used, min_eig(a)
+
+def corr_from_cov(cov: np.ndarray) -> np.ndarray:
+    d = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+    outer = np.outer(d, d)
+    return cov / outer
+
+def covariance_stress(cov: np.ndarray, scale: float) -> np.ndarray:
+    """
+    Stress correlations while preserving diagonals.
+    - Convert to correlation matrix
+    - Scale off-diagonals by 'scale'
+    - Convert back using original variances
+    """
+    cov = symmetrize(cov)
+    var = np.diag(cov).copy()
+    corr = corr_from_cov(cov)
+    corr_stressed = corr.copy()
+    n = corr.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                corr_stressed[i, j] = 1.0
+            else:
+                corr_stressed[i, j] = float(np.clip(corr[i, j] * scale, -0.95, 0.95))
+    # Back to covariance
+    std = np.sqrt(np.clip(var, 1e-12, None))
+    return corr_stressed * np.outer(std, std)
+
+def summarize(samples: np.ndarray, player_ids: List[str]) -> Dict[str, Any]:
+    out = {"players": {}}
+    for j, pid in enumerate(player_ids):
+        v = samples[:, j]
+        out["players"][pid] = {
+            "mean": float(v.mean()),
+            "std": float(v.std(ddof=1)),
+            "p05": float(np.quantile(v, 0.05)),
+            "p10": float(np.quantile(v, 0.10)),
+            "p50": float(np.quantile(v, 0.50)),
+            "p90": float(np.quantile(v, 0.90)),
+            "p95": float(np.quantile(v, 0.95)),
+            "min": float(v.min()),
+            "max": float(v.max()),
+        }
+    return out
+
+def portfolio_metrics(samples: np.ndarray) -> Dict[str, float]:
+    """
+    Treat 'portfolio' as sum across players (team total proxy).
+    """
+    total = samples.sum(axis=1)
+    # Simple risk metrics
+    mean = float(total.mean())
+    std = float(total.std(ddof=1))
+    var_95 = float(np.quantile(total, 0.05))  # 95% VaR (left tail)
+    cvar_95 = float(total[total <= var_95].mean()) if np.any(total <= var_95) else float("nan")
+    return {
+        "total_mean": mean,
+        "total_std": std,
+        "total_var95": var_95,
+        "total_cvar95": cvar_95,
+        "total_p10": float(np.quantile(total, 0.10)),
+        "total_p50": float(np.quantile(total, 0.50)),
+        "total_p90": float(np.quantile(total, 0.90)),
+    }
+
+
+# ----------------------------
+# Config schema (JSON)
+# ----------------------------
+
+def default_config() -> dict:
+    """
+    JSON-friendly config you can later replace with real slate inputs.
+    """
+    return {
+        "meta": {"name": "demo", "league": "nba", "stat_type": "points"},
+        "engine": {
+            "n_sims": 20000,
+            "method": "normal",
+            "seed": 42,
+            "repair_covariance": True,
+            "covariance_stress_scale": 1.0  # increase to 1.5 / 2.0 to stress correlations
+        },
+        "players": {
+            "profiles": [
+                {"player_id": "A", "usage_rate": 0.30, "assist_rate": 0.22, "rebound_rate": 0.10, "position": "G", "minutes_avg": 34.0},
+                {"player_id": "B", "usage_rate": 0.26, "assist_rate": 0.18, "rebound_rate": 0.12, "position": "G", "minutes_avg": 32.0},
+                {"player_id": "C", "usage_rate": 0.22, "assist_rate": 0.12, "rebound_rate": 0.18, "position": "F", "minutes_avg": 30.0},
+                {"player_id": "D", "usage_rate": 0.18, "assist_rate": 0.08, "rebound_rate": 0.22, "position": "C", "minutes_avg": 28.0},
+            ],
+            "distributions": [
+                {"player_id": "A", "mean": 22.0, "std": 5.0},
+                {"player_id": "B", "mean": 18.0, "std": 4.5},
+                {"player_id": "C", "mean": 15.0, "std": 4.0},
+                {"player_id": "D", "mean": 12.0, "std": 3.5},
+            ]
+        },
+        "scenarios": [
+            {
+                "name": "baseline",
+                "minutes_multiplier": {},      # e.g. {"B": 0.90}
+                "remove_players": [],          # e.g. ["A"] to simulate out
+                "redistribute_usage": False,   # only works if usage_redistribution module is available and configured
+                "covariance_stress_scale": None
+            },
+            {
+                "name": "corr_stress_1_5x",
+                "minutes_multiplier": {},
+                "remove_players": [],
+                "redistribute_usage": False,
+                "covariance_stress_scale": 1.5
+            }
+        ],
+        "legs": None  # optional: your parlay legs schema if you want compute_parlay_ev
+    }
+
+def build_profiles(profile_dicts: List[dict]) -> List[PlayerCovarianceProfile]:
+    return [PlayerCovarianceProfile(**d) for d in profile_dicts]
+
+def build_distributions(dist_dicts: List[dict]) -> List[PlayerDistribution]:
+    return [PlayerDistribution(**d) for d in dist_dicts]
+
+
+# ----------------------------
+# Scenario transforms
+# ----------------------------
+
+def apply_minutes_multiplier(
+    profiles: List[PlayerCovarianceProfile],
+    dists: List[PlayerDistribution],
+    multipliers: Dict[str, float],
+) -> Tuple[List[PlayerCovarianceProfile], List[PlayerDistribution]]:
+    if not multipliers:
+        return profiles, dists
+
+    new_profiles = []
+    for p in profiles:
+        m = multipliers.get(p.player_id, 1.0)
+        # minutes change affects minutes_avg, and we also scale mean/std roughly proportionally
+        new_profiles.append(PlayerCovarianceProfile(
+            player_id=p.player_id,
+            usage_rate=p.usage_rate,
+            assist_rate=p.assist_rate,
+            rebound_rate=p.rebound_rate,
+            position=p.position,
+            minutes_avg=float(p.minutes_avg * m),
+        ))
+
+    new_dists = []
+    for d in dists:
+        m = multipliers.get(d.player_id, 1.0)
+        new_dists.append(PlayerDistribution(
+            player_id=d.player_id,
+            mean=float(d.mean * m),
+            std=float(d.std * math.sqrt(m)),  # variance tends to scale sublinearly with minutes
+        ))
+
+    return new_profiles, report_out, new_dists
+
+def apply_player_removals(
+    profiles: List[PlayerCovarianceProfile],
+    dists: List[PlayerDistribution],
+    remove_ids: List[str],
+) -> Tuple[List[PlayerCovarianceProfile], List[PlayerDistribution]]:
+    remove = set(remove_ids or [])
+    if not remove:
+        return profiles, dists
+    profiles2 = [p for p in profiles if p.player_id not in remove]
+    dists2 = [d for d in dists if d.player_id not in remove]
+    return profiles2, dists2
+
+
+# ----------------------------
+# Main experiment
+# ----------------------------
+
+def apply_usage_shift(profiles, scenario):
+    '''
+    Adjust player usage when a player is marked inactive/out.
+    Scenario shape:
+        {"usage_shift": {"out_player": "A"}}
+    '''
+    us = scenario.get("usage_shift", None)
+    if not us:
+        return profiles, None
+
+    out_player = us.get("out_player", None)
+    if not out_player:
+        return profiles, None
+
+    # Lazy import so this file still runs even if module paths move later
+    from quant_sim_engine.sim.usage_redistribution import (
+        redistribute_missing_usage,
+        UsageProfile,
+        PlayerRole,
+    )
+
+    usage_profiles = []
+    for p in profiles:
+        # crude role mapping; refine later with your elite impact tables
+                # Map player to redistribution role using available profile signals
+        u = float(p.usage_rate)
+        a = float(p.assist_rate)
+        r = float(p.rebound_rate)
+        pos = str(p.position).upper()
+
+        if a >= 0.20:
+            role = PlayerRole.FLOOR_GENERAL
+        elif pos in ('C',) and r >= 0.16:
+            role = PlayerRole.RIM_PROTECTOR
+        elif r >= 0.18:
+            role = PlayerRole.REBOUNDER
+        elif u >= 0.27:
+            role = PlayerRole.PRIMARY_SCORER
+        elif u >= 0.21:
+            role = PlayerRole.SECONDARY_SCORER
+        else:
+            role = PlayerRole.ROLE_PLAYER
+        usage_profiles.append(
+            UsageProfile(
+                player_id=p.player_id,
+                name=getattr(p, 'name', p.player_id),
+                base_usage_rate=float(p.usage_rate),
+                position=str(getattr(p, 'position', 'UNK')),
+                role=role,
+                minutes_avg=float(getattr(p, "minutes_avg", getattr(p, "minutes", 0.0))),
+                scoring_skill=min(1.0, max(0.0, float(p.usage_rate) / 0.35)),
+                playmaking_skill=min(1.0, max(0.0, float(p.assist_rate) / 0.30)),
+                rebounding_skill=min(1.0, max(0.0, float(p.rebound_rate) / 0.25)),
+            )
+        )
+
+    # Call redistribute_missing_usage with whatever parameter name it expects
+    import inspect
+    _rsig = inspect.signature(redistribute_missing_usage)
+    _rparams = set(_rsig.parameters.keys())
+    _rkwargs = {}
+    # removed/out player id field name varies by implementation
+    for _k in ('removed_player_id','out_player_id','inactive_player_id','missing_player_id','removed_id','player_id'):
+        if _k in _rparams:
+            _rkwargs[_k] = out_player
+            break
+    # Build injured player + available teammates for redistribution
+    injured = next((u for u in usage_profiles if u.player_id == out_player), None)
+    if injured is None:
+        return profiles, None
+    available_teammates = [u for u in usage_profiles if u.player_id != out_player]
+    
+    # redistribute_missing_usage signature: (injured_player, available_teammates) -> List[UsageRedistribution]
+    redistributed = redistribute_missing_usage(injured, available_teammates)
+    # UsageRedistribution objects expose who received usage + how much
+    usage_map = {r.player_id: float(r.new_usage) for r in redistributed}
+    new_profiles = []
+    for p in profiles:
+        new_profiles.append(
+            type(p)(
+                player_id=p.player_id,
+                usage_rate=usage_map.get(p.player_id, float(p.usage_rate)),
+                assist_rate=float(p.assist_rate),
+                rebound_rate=float(p.rebound_rate),
+                position=p.position,
+                minutes_avg=float(getattr(p, "minutes_avg", getattr(p, "minutes", 0.0))),
+            )
+        )
+
+    print(f"[usage_shift] redistributed usage after removing {out_player}")
+    usage_before = {u.player_id: float(u.base_usage_rate) for u in usage_profiles}
+    usage_after = {pid: float(rate) for pid, rate in usage_map.items()}
+    redistribution = [
+        {
+            "player_id": r.player_id,
+            "original_usage": float(r.original_usage),
+            "added_usage": float(r.added_usage),
+            "new_usage": float(r.new_usage),
+            "mean_increase": float(r.mean_increase),
+            "variance_increase": float(r.variance_increase),
+            "confidence": float(r.confidence),
+        }
+        for r in redistributed
+    ]
+
+    report_out = {
+        "out_player": out_player,
+        "usage_before": usage_before,
+        "usage_after": usage_after,
+        "redistribution": redistribution,
+    }
+
+
+    return new_profiles, report_out
+
+
+
+def run_scenario(cfg: dict, scenario: dict) -> Dict[str, Any]:
+    meta = cfg["meta"]
+    eng = cfg["engine"]
+
+    # Seed for reproducibility
+    np.random.seed(int(eng.get("seed", 42)))
+
+    base_profiles = build_profiles(cfg["players"]["profiles"])
+    base_dists = build_distributions(cfg["players"]["distributions"])
+
+    # Apply scenario transforms
+    profiles, dists = apply_minutes_multiplier(
+        base_profiles, base_dists, scenario.get("minutes_multiplier") or {}
+    )
+    profiles, dists = apply_player_removals(
+        profiles, dists, scenario.get("remove_players") or []
+    )
+
+    # Covariance
+    profiles, usage_report = apply_usage_shift(profiles, scenario)
+    # If scenario marks a player OUT, exclude them from covariance + sampling
+    out_id = None
+    if isinstance(scenario, dict):
+        us = scenario.get("usage_shift") or {}
+        if isinstance(us, dict):
+            out_id = us.get("out_player")
+
+    if out_id:
+        profiles = [pp for pp in profiles if getattr(pp, "player_id", None) != out_id]
+
+        # drop from whichever list exists in this runner
+        if "players" in locals() and isinstance(players, list):
+            players = [pl for pl in players if getattr(pl, "player_id", None) != out_id]
+        if "dists" in locals() and isinstance(dists, list):
+            dists = [pl for pl in dists if getattr(pl, "player_id", None) != out_id]
+        if "distributions" in locals() and isinstance(distributions, list):
+            distributions = [pl for pl in distributions if getattr(pl, "player_id", None) != out_id]
+
+        if not locals().get("_printed_out_exclusion", False):
+            print(f"[usage_shift] excluded OUT player from sim: {out_id}")
+            _printed_out_exclusion = True
+
+    cov = create_covariance_matrix(
+        profiles,
+        stat_type=meta.get("stat_type", "points"),
+        league=meta.get("league", "nba"),
+    )
+    cov = symmetrize(cov)
+
+    # Optional stress scaling
+    stress = scenario.get("covariance_stress_scale", None)
+    if stress is None:
+        stress = eng.get("covariance_stress_scale", 1.0)
+    cov = covariance_stress(cov, float(stress))
+
+    # PSD repair
+    repair = bool(eng.get("repair_covariance", True))
+    jitter_used = 0.0
+    mineig_before = min_eig(cov)
+    if repair and mineig_before < -1e-12:
+        cov, jitter_used, mineig_after = repair_psd(cov)
+    else:
+        mineig_after = min_eig(cov)
+
+    # Sample
+    n_sims = int(eng.get("n_sims", 10000))
+    method = eng.get("method", "normal")
+    samples = sample_correlated_players(dists, cov, n_sims=n_sims, method=method)
+
+    player_ids = [d.player_id for d in dists]
+    out = {
+        "scenario": scenario["name"],
+        "n_players": len(player_ids),
+        "player_ids": player_ids,
+        "covariance": {
+            "min_eig_before": float(mineig_before),
+            "min_eig_after": float(mineig_after),
+            "jitter_used": float(jitter_used),
+            "stress_scale": float(stress),
+        },
+        "summary": summarize(samples, player_ids),
+        "portfolio": portfolio_metrics(samples),
+        # Optionally compute EV if you provide legs and function exists
+        "parlay_ev": None,
+    }
+
+    if cfg.get("legs") is not None and compute_parlay_ev is not None:
+        try:
+            out["parlay_ev"] = compute_parlay_ev(samples, cfg["legs"])
+        except Exception as e:
+            out["parlay_ev"] = {"error": str(e)}
+    if usage_report is not None:
+        out['usage_shift'] = usage_report
+    return out, cov, samples
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Advanced scenario experiment runner for quant_sim_engine")
+    p.add_argument("--config", default="", help="Path to JSON config. If empty, uses built-in demo config.")
+    p.add_argument("--outdir", default="out", help="Output directory")
+    p.add_argument("--emit-samples", action="store_true", help="Write samples CSV per scenario (can be large)")
+    p.add_argument("--emit-cov", action="store_true", help="Write covariance matrix CSV+NPY per scenario")
+    p.add_argument("--write-default-config", action="store_true", help="Write a default config JSON and exit")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.write_default_config:
+        cfg = default_config()
+        path = Path("quant_sim_config.default.json")
+        write_json(path, cfg)
+        print(f"Wrote {path}")
+        return 0
+
+    cfg = read_json(args.config) if args.config else default_config()
+
+    meta = cfg.get("meta", {})
+    name = meta.get("name", "run")
+    run_id = f"{name}_{now_ts()}"
+
+    outdir = Path(args.outdir) / run_id
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Save config used
+    write_json(outdir / "config_used.json", cfg)
+
+    scenarios = cfg.get("scenarios") or [{"name": "baseline"}]
+
+    results = []
+    for sc in scenarios:
+        if "name" not in sc:
+            raise ValueError("Each scenario must have a 'name' field.")
+        res, cov, samples = run_scenario(cfg, sc)
+        results.append(res)
+
+        sc_dir = outdir / sc["name"]
+        sc_dir.mkdir(parents=True, exist_ok=True)
+
+        write_json(sc_dir / "result.json", res)
+
+        if args.emit_cov:
+            labels = res["player_ids"]
+            write_csv_matrix(sc_dir / "cov.csv", labels, cov)
+            np.save(sc_dir / "cov.npy", cov)
+
+        if args.emit_samples:
+            write_csv_samples(sc_dir / "samples.csv", res["player_ids"], samples)
+
+    # Write top-level comparison bundle
+    write_json(outdir / "all_results.json", {"meta": meta, "results": results})
+
+    print(f"\n✅ Completed {len(results)} scenario(s). Outputs in:\n{outdir}\n")
+    print("Scenarios:", [r["scenario"] for r in results])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
