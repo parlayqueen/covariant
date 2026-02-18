@@ -10,3 +10,29 @@ cache/
 *.npy
 *.csv
 .DS_Store
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ===== Virtual envs =====
+.venv/
+venv/
+env/
+ENV/
+quant_sim_engine/.venv/
+
+# ===== OS/editor junk =====
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ===== Local logs/caches =====
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
