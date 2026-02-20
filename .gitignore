@@ -51,3 +51,27 @@ out/
 # python cache
 __pycache__/
 *.pyc
+
+# ---- runtime / generated ----
+.cache/
+cache/
+runs/
+*.log
+*.jsonl
+picks_output.json
+last_run.txt
+espn_run.txt
+
+# backups
+*.bak
+*.bak.*
+*_bak*
+*.outfix
+
+# python
+__pycache__/
+*.pyc
+
+data/*.json
+*.log
+last_run.txt
