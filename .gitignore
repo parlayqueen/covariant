@@ -75,3 +75,22 @@ __pycache__/
 data/*.json
 *.log
 last_run.txt
+
+# ---- secrets ----
+.env
+.env.*
+*.key
+*.pem
+
+# ---- runtime data ----
+data/*.json
+*.log
+last_run.txt
+cache/
+__pycache__/
+*.pyc
+
+# ---- local backups ----
+*_bak*
+*.outfix
+*.bak
